@@ -10,7 +10,9 @@ COMBINED ANCHANTO PROCESSING SCRIPT (GCS INPUT/OUTPUT)
 """
 
 import io
+import os
 import csv
+import tempfile
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -317,75 +319,49 @@ def find_column(df, keywords):
             return col
     return None
 
-def build_parquet_from_gcs_csvs(bucket):
-    print("\n" + "🔹" * 35)
-    print("STEP 3: Building Parquet file from GCS CSV files")
-    print("🔹" * 35)
+FINAL_COLUMN_ORDER = [
+    "Source", "Marketplace", "CreatedOn", "SentOn", "Order Number", "Item Upc",
+    "Item Name", "Order Status", "Customer Name", "Shipping City", "Shipping Postcode",
+    "Ordered Quantity", "Unit Price", "Discount Value", "Brand", "Category",
+    "Sub Category", "Variant", "Product Name", "Type of Item",
+]
 
-    all_csv_blobs = bucket.list_blobs(prefix=f"{CSV_OUTPUT_PREFIX}/")
-    csv_blobs = [b for b in all_csv_blobs if b.name.endswith('.csv') and "$" not in parse_gcs_blob_name(b.name)]
-    
-    if not csv_blobs:
-        print(f"⚠️  No CSV files found in gs://{GCS_BUCKET_NAME}/{CSV_OUTPUT_PREFIX}/")
-        return False
-        
-    print(f"Found {len(csv_blobs)} CSV file(s).")
-    data_frames = []
-    
-    for b in csv_blobs:
-        try:
-            content = b.download_as_bytes()
-            df = pd.read_csv(io.BytesIO(content), encoding='utf-8', usecols=lambda col: col in EXPECTED_COLUMNS, dtype=str, low_memory=False)
-            filename_without_ext = parse_gcs_blob_name(b.name)[:-4]
-            df["Name"] = filename_without_ext
-            data_frames.append(df)
-            print(f"Loaded: {parse_gcs_blob_name(b.name)} ({len(df)} rows)")
-        except Exception as e:
-            print(f"Error reading {b.name}: {e}")
+# Columns with a non-string target type in the fixed output schema below.
+# Everything else in FINAL_COLUMN_ORDER is a string column.
+_INT_COLUMNS = {"Ordered Quantity", "Unit Price", "Discount Value"}
+_TIMESTAMP_COLUMNS = {"CreatedOn", "SentOn"}
 
-    if not data_frames:
-        return False
 
-    combined = pd.concat(data_frames, ignore_index=True)
-    print(f"Total rows before transformation: {len(combined):,}")
+def build_output_schema():
+    """A fixed pyarrow schema every per-file chunk is cast to, so writing
+    row groups one file at a time to the same ParquetWriter never hits a
+    schema mismatch from one chunk happening to be all-null where another
+    isn't."""
+    import pyarrow as pa
+    fields = []
+    for col in FINAL_COLUMN_ORDER:
+        if col in _INT_COLUMNS:
+            fields.append(pa.field(col, pa.int64()))
+        elif col in _TIMESTAMP_COLUMNS:
+            fields.append(pa.field(col, pa.timestamp("us")))
+        else:
+            fields.append(pa.field(col, pa.string()))
+    return pa.schema(fields)
 
-    delivery = combined.get("Delivery Date (DD/MM/YYYY)", pd.Series([None] * len(combined)))
-    dispatch = combined.get("Dispatch Date", pd.Series([None] * len(combined)))
-    scheduled = combined.get("Dispatch Scheduled Date", pd.Series([None] * len(combined)))
-    
-    combined["SentOn"] = np.where(delivery.notna() & (delivery != ""), delivery,
-                                   np.where(dispatch.notna() & (dispatch != ""), dispatch, scheduled))
-    
-    drop_cols = ["Order Packing Date", "Delivery Date (DD/MM/YYYY)", "Dispatch Scheduled Date", "Dispatch Date"]
-    drop_existing = [c for c in drop_cols if c in combined.columns]
-    combined.drop(columns=drop_existing, inplace=True)
-    combined.rename(columns={"Order Date": "CreatedOn", "Name": "Source"}, inplace=True)
 
-    for col in ["CreatedOn", "SentOn"]:
-        if col in combined.columns:
-            combined[col] = pd.to_datetime(combined[col], errors='coerce')
-    for col in ["Ordered Quantity", "Unit Price", "Discount Value"]:
-        if col in combined.columns:
-            combined[col] = pd.to_numeric(combined[col], errors='coerce').fillna(0).astype('int64')
-
-    text_cols = ["Marketplace", "Order Number", "Item Upc", "Item Name", "Order Status", "Customer Name", "Shipping City", "Shipping Postcode", "Source"]
-    for col in text_cols:
-        if col in combined.columns:
-            combined[col] = combined[col].fillna("").astype(str)
-
-    uppercase_cols = ["Item Name", "Marketplace", "Source", "Order Status", "Customer Name", "Shipping City"]
-    for col in uppercase_cols:
-        if col in combined.columns:
-            combined[col] = combined[col].str.upper()
-
+def load_product_master(bucket):
     print("\nLoading product master from CSV...")
     master_blob = bucket.blob(MASTER_CSV_BLOB)
     if not master_blob.exists():
         print(f"ERROR: Master file not found at gs://{GCS_BUCKET_NAME}/{MASTER_CSV_BLOB}")
-        return False
+        return None
 
     master_bytes = master_blob.download_as_bytes()
-    product_df = pd.read_csv(io.BytesIO(master_bytes), header=0)
+    # This master file is semicolon-delimited and cp1252-encoded (matches
+    # the source Excel export), not comma/utf-8 - a pre-existing mismatch in
+    # this script that never surfaced before because earlier runs always
+    # crashed on the full-history concat well before reaching this step.
+    product_df = pd.read_csv(io.BytesIO(master_bytes), header=0, sep=';', encoding='cp1252')
 
     item_col = find_column(product_df, ["item", "name"])
     brand_col = find_column(product_df, ["brand"])
@@ -409,29 +385,122 @@ def build_parquet_from_gcs_csvs(bucket):
     product_master = product_master.drop_duplicates(subset=["ItemName"])
     product_master = product_master[product_master["ItemName"] != ""]
     print(f"Product master cleaned: {len(product_master):,} unique items")
+    return product_master
 
-    print("\nMerging with product master...")
-    combined = combined.merge(product_master, left_on="Item Name", right_on="ItemName", how="left")
-    combined.drop(columns=["ItemName"], inplace=True)
 
-    final_order = ["Source", "Marketplace", "CreatedOn", "SentOn", "Order Number", "Item Upc", "Item Name", "Order Status", "Customer Name", "Shipping City", "Shipping Postcode", "Ordered Quantity", "Unit Price", "Discount Value", "Brand", "Category", "Sub Category", "Variant", "Product Name", "Type of Item"]
-    final_order = [col for col in final_order if col in combined.columns]
-    combined = combined[final_order]
+def transform_chunk(df, product_master):
+    """Apply the same per-row transforms the old full-concat version applied
+    once to everything, but to a single file's rows at a time."""
+    delivery = df.get("Delivery Date (DD/MM/YYYY)", pd.Series([None] * len(df)))
+    dispatch = df.get("Dispatch Date", pd.Series([None] * len(df)))
+    scheduled = df.get("Dispatch Scheduled Date", pd.Series([None] * len(df)))
+    df["SentOn"] = np.where(delivery.notna() & (delivery != ""), delivery,
+                             np.where(dispatch.notna() & (dispatch != ""), dispatch, scheduled))
 
-    print("\nSaving to Parquet on GCS...")
-    parquet_buffer = io.BytesIO()
-    if HAVE_PYARROW:
-        combined.to_parquet(parquet_buffer, index=False, engine="pyarrow", compression="zstd", coerce_timestamps="us")
-    else:
-        combined.to_parquet(parquet_buffer, index=False, engine="fastparquet", compression="snappy")
+    drop_cols = ["Order Packing Date", "Delivery Date (DD/MM/YYYY)", "Dispatch Scheduled Date", "Dispatch Date"]
+    df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
+    df.rename(columns={"Order Date": "CreatedOn", "Name": "Source"}, inplace=True)
 
-    parquet_buffer.seek(0)
+    for col in ["CreatedOn", "SentOn"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+    for col in ["Ordered Quantity", "Unit Price", "Discount Value"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('int64')
+
+    text_cols = ["Marketplace", "Order Number", "Item Upc", "Item Name", "Order Status",
+                 "Customer Name", "Shipping City", "Shipping Postcode", "Source"]
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str)
+
+    uppercase_cols = ["Item Name", "Marketplace", "Source", "Order Status", "Customer Name", "Shipping City"]
+    for col in uppercase_cols:
+        if col in df.columns:
+            df[col] = df[col].str.upper()
+
+    df = df.merge(product_master, left_on="Item Name", right_on="ItemName", how="left")
+    df.drop(columns=["ItemName"], inplace=True)
+
+    # Guarantee every output column exists (even if this particular file's
+    # rows are missing one), so every chunk matches the fixed schema exactly.
+    for col in FINAL_COLUMN_ORDER:
+        if col not in df.columns:
+            df[col] = None
+    return df[FINAL_COLUMN_ORDER]
+
+
+def build_parquet_from_gcs_csvs(bucket):
+    print("\n" + "🔹" * 35)
+    print("STEP 3: Building Parquet file from GCS CSV files (streamed, one file at a time)")
+    print("🔹" * 35)
+
+    if not HAVE_PYARROW:
+        print("ERROR: pyarrow is required for the streaming Parquet build.")
+        return False
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    all_csv_blobs = bucket.list_blobs(prefix=f"{CSV_OUTPUT_PREFIX}/")
+    csv_blobs = [b for b in all_csv_blobs if b.name.endswith('.csv') and "$" not in parse_gcs_blob_name(b.name)]
+
+    if not csv_blobs:
+        print(f"⚠️  No CSV files found in gs://{GCS_BUCKET_NAME}/{CSV_OUTPUT_PREFIX}/")
+        return False
+    print(f"Found {len(csv_blobs)} CSV file(s).")
+
+    product_master = load_product_master(bucket)
+    if product_master is None:
+        return False
+
+    schema = build_output_schema()
+    total_rows = 0
     out_parquet_blob = bucket.blob(OUTPUT_PARQUET_BLOB)
-    out_parquet_blob.upload_from_file(parquet_buffer, content_type="application/octet-stream")
 
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+    os.close(tmp_fd)
+    try:
+        writer = pq.ParquetWriter(tmp_path, schema, compression="zstd")
+        try:
+            for b in csv_blobs:
+                try:
+                    content = b.download_as_bytes()
+                    df = pd.read_csv(
+                        io.BytesIO(content), encoding='utf-8',
+                        usecols=lambda col: col in EXPECTED_COLUMNS, dtype=str, low_memory=False,
+                    )
+                except Exception as e:
+                    print(f"Error reading {b.name}: {e}")
+                    continue
+
+                filename_without_ext = parse_gcs_blob_name(b.name)[:-4]
+                df["Name"] = filename_without_ext
+                df = transform_chunk(df, product_master)
+
+                table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+                writer.write_table(table)
+                total_rows += len(df)
+                print(f"Processed {filename_without_ext}: {len(df):,} rows (running total {total_rows:,})")
+                del df, table
+        finally:
+            writer.close()
+
+        if total_rows == 0:
+            print("⚠️  No rows written - nothing to upload.")
+            return False
+
+        print("\nUploading Parquet to GCS...")
+        out_parquet_blob.upload_from_filename(tmp_path, content_type="application/octet-stream")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    out_parquet_blob.reload()
     file_size_gb = out_parquet_blob.size / (1024**3)
     print(f"\n✅ SUCCESS: Parquet saved to gs://{GCS_BUCKET_NAME}/{OUTPUT_PARQUET_BLOB}")
-    print(f"   Total rows: {len(combined):,}")
+    print(f"   Total rows: {total_rows:,}")
     print(f"   File size: {file_size_gb:.2f} GB")
     return True
 
