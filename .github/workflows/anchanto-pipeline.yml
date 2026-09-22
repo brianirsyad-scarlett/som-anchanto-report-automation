@@ -1,0 +1,43 @@
+name: Anchanto Report Pipeline
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 00:30 Asia/Jakarta (WIB, UTC+7) = 17:30 UTC the previous day.
+    - cron: "30 17 * * *"
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write .env from secrets
+        run: |
+          cat <<EOF > .env
+          ANCHANTO_EMAIL=${{ secrets.ANCHANTO_EMAIL }}
+          ANCHANTO_PASSWORD=${{ secrets.ANCHANTO_PASSWORD }}
+          EOF
+
+      - name: Write GCS credentials from secret
+        run: |
+          cat <<'EOF' > gcp_key.json
+          ${{ secrets.GCP_SA_KEY }}
+          EOF
+
+      - name: Download completed reports from Anchanto to GCS
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp_key.json
+        run: python download_anchanto_reports.py
+
+      - name: Process GCS raw CSVs into Excel, CSV, and Parquet
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp_key.json
+        run: python BigQuery_Anchanto.py

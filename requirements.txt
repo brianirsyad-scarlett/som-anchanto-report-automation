@@ -1,0 +1,7 @@
+requests
+google-cloud-storage
+pandas
+numpy
+openpyxl
+tqdm
+pyarrow
