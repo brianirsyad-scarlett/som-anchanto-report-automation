@@ -18,8 +18,13 @@ count), since the number of reports ready at run time can vary.
 2. `BigQuery_Anchanto.py` (unchanged copy of the existing local script) -
    reads those raw CSVs from GCS, filters/validates rows, converts to Excel
    (named by the order date found in the file), converts to CSV, then
-   combines every CSV into `gs://bucket_som/sales_parquet/Anchanto.parquet`
-   (merged with the product master data already mirrored to GCS). Deletes
+   combines every CSV into
+   `gs://bucket_som/sales_parquet/raw/primary/anchanto/Anchanto.parquet`
+   (merged with the product master data already mirrored to GCS). It keeps a
+   raw `Dispatch Date` column beside `SentOn` for the Sell In pipeline.
+   `sales_parquet/Anchanto.parquet` is deliberately NOT written here - the
+   local pipeline still owns that name (PCC reads it); switch over when the
+   local pipeline is retired. Deletes
    the raw source CSVs from GCS after processing.
 
 Reprocessing a report that was already consumed is harmless: since the

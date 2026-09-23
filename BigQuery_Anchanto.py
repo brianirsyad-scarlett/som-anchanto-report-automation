@@ -51,7 +51,11 @@ CSV_OUTPUT_PREFIX = "sales_parquet/raw/primary/anchanto"
 
 # Exact GCS Blob Keys for Master Data and Final Parquet
 MASTER_CSV_BLOB = "sales_parquet/Master Data Product.csv"
-OUTPUT_PARQUET_BLOB = "sales_parquet/Anchanto.parquet"
+# Not "sales_parquet/Anchanto.parquet": that one is still owned by the local
+# pipeline (uploaded by the mirror daemon) and read by PCC. Two writers on one
+# name means whichever runs last wins, so this copy lives beside its CSVs until
+# the local pipeline is retired.
+OUTPUT_PARQUET_BLOB = "sales_parquet/raw/primary/anchanto/Anchanto.parquet"
 
 MAX_WORKERS = 10
 DELETE_SOURCE = True
@@ -324,12 +328,16 @@ FINAL_COLUMN_ORDER = [
     "Item Name", "Order Status", "Customer Name", "Shipping City", "Shipping Postcode",
     "Ordered Quantity", "Unit Price", "Discount Value", "Brand", "Category",
     "Sub Category", "Variant", "Product Name", "Type of Item",
+    # The raw dispatch date, kept beside the blended SentOn above. Sell In
+    # defines its sale date as Dispatch Date, else CreatedOn - which cannot be
+    # recovered from SentOn (Delivery, else Dispatch, else Scheduled).
+    "Dispatch Date",
 ]
 
 # Columns with a non-string target type in the fixed output schema below.
 # Everything else in FINAL_COLUMN_ORDER is a string column.
 _INT_COLUMNS = {"Ordered Quantity", "Unit Price", "Discount Value"}
-_TIMESTAMP_COLUMNS = {"CreatedOn", "SentOn"}
+_TIMESTAMP_COLUMNS = {"CreatedOn", "SentOn", "Dispatch Date"}
 
 
 def build_output_schema():
@@ -397,14 +405,14 @@ def transform_chunk(df, product_master):
     df["SentOn"] = np.where(delivery.notna() & (delivery != ""), delivery,
                              np.where(dispatch.notna() & (dispatch != ""), dispatch, scheduled))
 
-    drop_cols = ["Order Packing Date", "Delivery Date (DD/MM/YYYY)", "Dispatch Scheduled Date", "Dispatch Date"]
+    drop_cols = ["Order Packing Date", "Delivery Date (DD/MM/YYYY)", "Dispatch Scheduled Date"]
     df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
     df.rename(columns={"Order Date": "CreatedOn", "Name": "Source"}, inplace=True)
 
     # Source dates are dd/mm/yyyy. dayfirst must be explicit: pandas infers the
     # format from each chunk's first value, so a file starting on day <= 12 would
     # otherwise be read month-first (days 1-12 swapped, days 13+ -> NaT).
-    for col in ["CreatedOn", "SentOn"]:
+    for col in ["CreatedOn", "SentOn", "Dispatch Date"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
     for col in ["Ordered Quantity", "Unit Price", "Discount Value"]:
