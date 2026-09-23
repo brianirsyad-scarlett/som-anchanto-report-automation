@@ -401,9 +401,12 @@ def transform_chunk(df, product_master):
     df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
     df.rename(columns={"Order Date": "CreatedOn", "Name": "Source"}, inplace=True)
 
+    # Source dates are dd/mm/yyyy. dayfirst must be explicit: pandas infers the
+    # format from each chunk's first value, so a file starting on day <= 12 would
+    # otherwise be read month-first (days 1-12 swapped, days 13+ -> NaT).
     for col in ["CreatedOn", "SentOn"]:
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors='coerce')
+            df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
     for col in ["Ordered Quantity", "Unit Price", "Discount Value"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('int64')
@@ -441,8 +444,21 @@ def build_parquet_from_gcs_csvs(bucket):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    all_csv_blobs = bucket.list_blobs(prefix=f"{CSV_OUTPUT_PREFIX}/")
+    all_csv_blobs = bucket.list_blobs(prefix=f"{CSV_OUTPUT_PREFIX}/", delimiter="/")
     csv_blobs = [b for b in all_csv_blobs if b.name.endswith('.csv') and "$" not in parse_gcs_blob_name(b.name)]
+
+    # Only build from CSVs that still have their source Excel. The CSV folder holds
+    # orphans from an old backfill ("25 01 Jan" next to the real "25 1 Jan") that
+    # would otherwise be counted twice.
+    excel_stems = {
+        parse_gcs_blob_name(b.name)[:-5]
+        for b in bucket.list_blobs(prefix=f"{EXCEL_OUTPUT_PREFIX}/", delimiter="/")
+        if b.name.endswith('.xlsx')
+    }
+    orphans = [b for b in csv_blobs if parse_gcs_blob_name(b.name)[:-4] not in excel_stems]
+    csv_blobs = [b for b in csv_blobs if parse_gcs_blob_name(b.name)[:-4] in excel_stems]
+    for b in orphans:
+        print(f"⏭️  Skipping orphan CSV with no source Excel: {parse_gcs_blob_name(b.name)}")
 
     if not csv_blobs:
         print(f"⚠️  No CSV files found in gs://{GCS_BUCKET_NAME}/{CSV_OUTPUT_PREFIX}/")
