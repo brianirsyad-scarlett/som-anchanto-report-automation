@@ -32,12 +32,34 @@ jobs:
           ${{ secrets.GCP_SA_KEY }}
           EOF
 
+      - name: Skip if today's run already happened (late GitHub schedule)
+        id: guard
+        if: github.event_name == 'schedule'
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp_key.json
+        run: |
+          # The iMac starts this pipeline on time; GitHub's own cron usually arrives
+          # hours later. If today's output (Asia/Jakarta) is already there, stop -
+          # a second build would only re-trigger the downstream Sell In chain.
+          python - <<'EOF'
+          import datetime as dt, os
+          from zoneinfo import ZoneInfo
+          from google.cloud import storage
+          wib = ZoneInfo("Asia/Jakarta")
+          b = storage.Client().bucket("bucket_som").get_blob("sales_parquet/raw/primary/anchanto/Anchanto.parquet")
+          done = b is not None and b.updated.astimezone(wib).date() == dt.datetime.now(wib).date()
+          print(f"today's output already built: {done}" + (f" ({b.updated.astimezone(wib):%H:%M} WIB)" if b else ""))
+          print("skip=true" if done else "skip=false", file=open(os.environ["GITHUB_OUTPUT"], "a"))
+          EOF
+
       - name: Download completed reports from Anchanto to GCS
+        if: steps.guard.outputs.skip != 'true'
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp_key.json
         run: python download_anchanto_reports.py
 
       - name: Process GCS raw CSVs into Excel, CSV, and Parquet
+        if: steps.guard.outputs.skip != 'true'
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp_key.json
         run: python BigQuery_Anchanto.py
