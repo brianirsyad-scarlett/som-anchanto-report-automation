@@ -1,0 +1,66 @@
+name: Dispatch - on-time start from Power Automate
+
+# GitHub's own cron starts runs late - on 2026-09-25 the 02:00/02:30 WIB jobs
+# began 3 h late and a 07:05 run had not started by 08:16. Issue events are
+# delivered in seconds, so the Power Automate flow "GitHub timer" creates an
+# issue labelled "run" at every slot:
+#
+#     title  RUN|<workflow file>[|name=value;name=value]
+#     e.g.   RUN|b2b-fire.yml
+#            RUN|b2b-collect.yml|expect_today=true
+#            RUN|sell-in-pipeline.yml|force=false
+#
+# and this starts that workflow in this repo at once (with those inputs),
+# then closes the issue. Every workflow keeps its cron as a backup; its guard
+# job (guard.sh) skips a backup run when the on-time run already did the work.
+#
+# Same file in every som-* repo. Only "labeled" is listened to, so ordinary
+# issues (e.g. the B2B report emails) never start it, and it only acts when
+# the repo owner added the label - in a public repo nobody else can.
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  actions: write
+  issues: write
+  contents: read
+
+jobs:
+  dispatch:
+    if: >-
+      github.event.label.name == 'run'
+      && startsWith(github.event.issue.title, 'RUN|')
+      && github.event.sender.login == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TITLE: ${{ github.event.issue.title }}
+      NUMBER: ${{ github.event.issue.number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/workflows
+
+      - name: Start the workflow named in the issue
+        run: |
+          IFS='|' read -r _ wf opts <<< "$TITLE"
+          refuse() {
+            gh issue close "$NUMBER" -R "$GITHUB_REPOSITORY" -r "not planned" -c "Nothing started: $1"
+            echo "::error::$1"; exit 1
+          }
+          [[ "$wf" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]] && [ -f ".github/workflows/$wf" ] && [ "$wf" != "dispatch.yml" ] \
+            || refuse "no workflow \`$wf\` in this repo"
+          args=()
+          if [ -n "$opts" ]; then
+            IFS=';' read -ra kvs <<< "$opts"
+            for kv in "${kvs[@]}"; do
+              [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_.,:-]*$ ]] || refuse "bad input \`$kv\`"
+              args+=(-f "$kv")
+            done
+          fi
+          gh workflow run "$wf" -R "$GITHUB_REPOSITORY" --ref "${{ github.event.repository.default_branch }}" "${args[@]}"
+          echo "started $wf ${args[*]}"
+          gh issue close "$NUMBER" -R "$GITHUB_REPOSITORY" \
+            -c "Started \`$wf\` ${args[*]} at $(TZ=Asia/Jakarta date '+%Y-%m-%d %H:%M') WIB."

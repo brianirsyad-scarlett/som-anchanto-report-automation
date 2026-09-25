@@ -2,12 +2,32 @@ name: Anchanto Report Pipeline
 
 on:
   workflow_dispatch: {}
+  # On time: Power Automate 'GitHub timer' -> dispatch.yml. Cron = backup only.
   schedule:
     # 00:30 Asia/Jakarta (WIB, UTC+7) = 17:30 UTC the previous day.
     - cron: "30 17 * * *"
 
 jobs:
+  # Backup (cron) runs skip themselves when the on-time run started by
+  # dispatch.yml (Power Automate "GitHub timer") already did the work - guard.sh.
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash guard.sh anchanto-pipeline.yml day
+
   pipeline:
+    needs: guard
+    if: needs.guard.outputs.run == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
