@@ -328,9 +328,8 @@ FINAL_COLUMN_ORDER = [
     "Item Name", "Order Status", "Customer Name", "Shipping City", "Shipping Postcode",
     "Ordered Quantity", "Unit Price", "Discount Value", "Brand", "Category",
     "Sub Category", "Variant", "Product Name", "Type of Item",
-    # The raw dispatch date, kept beside the blended SentOn above. Sell In
-    # defines its sale date as Dispatch Date, else CreatedOn - which cannot be
-    # recovered from SentOn (Delivery, else Dispatch, else Scheduled).
+    # SentOn is Dispatch Date, else CreatedOn (same rule as Primary_Sales and Sell In).
+    # The raw Dispatch Date is still kept beside it, since Sell In reads it directly.
     "Dispatch Date",
 ]
 
@@ -402,8 +401,8 @@ def transform_chunk(df, product_master):
     delivery = df.get("Delivery Date (DD/MM/YYYY)", pd.Series([None] * len(df)))
     dispatch = df.get("Dispatch Date", pd.Series([None] * len(df)))
     scheduled = df.get("Dispatch Scheduled Date", pd.Series([None] * len(df)))
-    df["SentOn"] = np.where(delivery.notna() & (delivery != ""), delivery,
-                             np.where(dispatch.notna() & (dispatch != ""), dispatch, scheduled))
+    # SentOn = Dispatch Date, else CreatedOn (same rule as Primary_Sales / Sell In)
+    df["SentOn"] = np.where(dispatch.notna() & (dispatch != ""), dispatch, df["Order Date"])
 
     drop_cols = ["Order Packing Date", "Delivery Date (DD/MM/YYYY)", "Dispatch Scheduled Date"]
     df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
