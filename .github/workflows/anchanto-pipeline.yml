@@ -4,8 +4,14 @@ on:
   workflow_dispatch: {}
   # On time: Power Automate 'GitHub timer' -> dispatch.yml. Cron = backup only.
   schedule:
-    # 00:30 Asia/Jakarta (WIB, UTC+7) = 17:30 UTC the previous day.
-    - cron: "30 17 * * *"
+    # Every 6 hours at :30 Asia/Jakarta (WIB, UTC+7): 00:30, 06:30, 12:30, 18:30
+    # = 17:30, 23:30, 05:30, 11:30 UTC. The run takes ~22 min, so the Sell In
+    # + PCC pipeline (which waits for it to finish) follows at :55.
+    - cron: "30 5,11,17,23 * * *"
+
+concurrency:
+  group: anchanto-pipeline
+  cancel-in-progress: false
 
 jobs:
   # Backup (cron) runs skip themselves when the on-time run started by
@@ -23,7 +29,7 @@ jobs:
       - id: g
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash guard.sh anchanto-pipeline.yml day
+        run: bash guard.sh anchanto-pipeline.yml 300
 
   pipeline:
     needs: guard
@@ -52,14 +58,14 @@ jobs:
           ${{ secrets.GCP_SA_KEY }}
           EOF
 
-      - name: Skip if today's run already happened (late GitHub schedule)
+      - name: Skip if a run already finished in the last 5 hours (late GitHub schedule)
         id: guard
         if: github.event_name == 'schedule'
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp_key.json
         run: |
-          # The iMac starts this pipeline on time; GitHub's own cron usually arrives
-          # hours later. If today's output (Asia/Jakarta) is already there, stop -
+          # Power Automate starts this pipeline on time; GitHub's own cron usually
+          # arrives hours later. If the output was rebuilt in the last 5 hours, stop -
           # a second build would only re-trigger the downstream Sell In chain.
           python - <<'EOF'
           import datetime as dt, os
@@ -67,8 +73,8 @@ jobs:
           from google.cloud import storage
           wib = ZoneInfo("Asia/Jakarta")
           b = storage.Client().bucket("bucket_som").get_blob("sales_parquet/raw/primary/anchanto/Anchanto.parquet")
-          done = b is not None and b.updated.astimezone(wib).date() == dt.datetime.now(wib).date()
-          print(f"today's output already built: {done}" + (f" ({b.updated.astimezone(wib):%H:%M} WIB)" if b else ""))
+          done = b is not None and (dt.datetime.now(dt.timezone.utc) - b.updated) < dt.timedelta(hours=5)
+          print(f"output already built in the last 5 hours: {done}" + (f" ({b.updated.astimezone(wib):%H:%M} WIB)" if b else ""))
           print("skip=true" if done else "skip=false", file=open(os.environ["GITHUB_OUTPUT"], "a"))
           EOF
 

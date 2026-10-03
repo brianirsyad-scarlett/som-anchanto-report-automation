@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Download the B2C Order Report(s) generated around 00:00-01:00 WIB today
-from Anchanto WMS, and upload the raw CSVs to GCS.
+"""Download the newest B2C Order Report of every period from Anchanto WMS and
+upload the raw CSVs to GCS.
 
-Anchanto's "other automation" (outside this repo) creates these reports
-around midnight WIB, one per ~10-day period, then regenerates each one
-every 1-2 hours as new orders arrive - each regeneration flips the older
-report's `state` from "completed" to "deleted" (but its `report_url` stays
-valid). Since GitHub Actions' schedule trigger can fire hours late, simply
-grabbing whatever is currently `state: completed` risks grabbing a much
-later refresh instead of the actual midnight snapshot. So instead, this
-searches BOTH completed and deleted reports for whichever ones were
-actually created in the 00:00-01:00 WIB window for today, regardless of
-their current state.
+Anchanto's "other automation" (outside this repo) creates one report per ~10-day
+period. The open period is regenerated about every 2 hours as new orders arrive;
+closed periods are regenerated once around 00:20 WIB. Each regeneration flips the
+older report's `state` from "completed" to "deleted" (its `report_url` stays valid).
+
+This pipeline runs every 6 hours, so each run takes, per period, the NEWEST report
+created in the last ANCHANTO_LOOKBACK_HOURS (default 8) - searching both completed
+and deleted reports. A period nothing regenerated in that window is skipped: its
+data is already in GCS from an earlier run.
 
 Credentials are read from a .env file next to this script and are never
 stored in the script itself.
@@ -72,11 +71,13 @@ def login(email, password):
     return jwt
 
 
-def target_window_utc(now_utc=None):
-    """Today's 00:00-01:00 WIB window, as UTC bounds."""
-    now_wib = (now_utc or datetime.now(timezone.utc)).astimezone(WIB)
-    day_start_wib = now_wib.replace(hour=0, minute=0, second=0, microsecond=0)
-    return day_start_wib.astimezone(timezone.utc), (day_start_wib + timedelta(hours=1)).astimezone(timezone.utc)
+LOOKBACK_HOURS = float(os.environ.get("ANCHANTO_LOOKBACK_HOURS", "8"))
+
+
+def lookback_window_utc(now_utc=None):
+    """The last LOOKBACK_HOURS, as UTC bounds."""
+    now = now_utc or datetime.now(timezone.utc)
+    return now - timedelta(hours=LOOKBACK_HOURS), now
 
 
 def fetch_reports(jwt, state, window_start):
@@ -115,7 +116,8 @@ def fetch_reports(jwt, state, window_start):
     return items
 
 
-def reports_in_window(items, window_start, window_end):
+def latest_reports(items, window_start, window_end):
+    """Per period (from_date, end_date), the newest B2C report created in the window."""
     matches = {}
     for item in items:
         a = item.get("attributes", {})
@@ -123,15 +125,13 @@ def reports_in_window(items, window_start, window_end):
         if not (filename.startswith("B2C_Order_Report_") and filename.endswith(".csv")):
             continue
         created_raw = a.get("created_at")
-        if not created_raw:
+        if not created_raw or not a.get("report_url"):
             continue
         created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
-        if not (window_start <= created < window_end):
+        if not (window_start <= created <= window_end):
             continue
         key = (a.get("from_date"), a.get("end_date"))
-        # Keep the earliest-created report per distinct date range, in case
-        # of more than one falling in the window for the same period.
-        if key not in matches or created < matches[key]["created"]:
+        if key not in matches or created > matches[key]["created"]:
             matches[key] = {
                 "filename": filename,
                 "report_url": a.get("report_url"),
@@ -180,15 +180,15 @@ def main():
     jwt = login(env["ANCHANTO_EMAIL"], env["ANCHANTO_PASSWORD"])
     print("Logged in to Anchanto WMS.")
 
-    window_start, window_end = target_window_utc()
-    print(f"Target window (UTC): {window_start.isoformat()} .. {window_end.isoformat()} "
-          f"(00:00-01:00 WIB today)")
+    window_start, window_end = lookback_window_utc()
+    print(f"Looking for reports created in the last {LOOKBACK_HOURS:g} h "
+          f"(UTC {window_start.isoformat()} .. {window_end.isoformat()})")
 
     all_items = fetch_reports(jwt, None, window_start) + fetch_reports(jwt, "deleted", window_start)
-    reports = reports_in_window(all_items, window_start, window_end)
+    reports = latest_reports(all_items, window_start, window_end)
 
     if not reports:
-        print("No reports found in the target window - falling back to whatever is currently completed.")
+        print("No report was regenerated in that window - falling back to whatever is currently completed.")
         reports = fetch_completed_fallback(jwt)
 
     if not reports:
@@ -196,7 +196,8 @@ def main():
 
     print(f"\nDownloading {len(reports)} report(s):")
     for r in reports:
-        print(f"  {r['filename']}  ({r['from_date']} .. {r['end_date']})")
+        made = f"  created {r['created'].astimezone(WIB):%m-%d %H:%M} WIB" if r.get("created") else ""
+        print(f"  {r['filename']}  ({r['from_date']} .. {r['end_date']}){made}")
 
     client = storage.Client()
     bucket = client.bucket(GCS_BUCKET)
