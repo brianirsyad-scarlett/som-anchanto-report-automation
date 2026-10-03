@@ -501,7 +501,7 @@ def build_parquet_from_gcs_csvs(bucket):
                     content = b.download_as_bytes()
                     df = pd.read_csv(
                         io.BytesIO(content), encoding='utf-8',
-                        usecols=lambda col: col in EXPECTED_COLUMNS, dtype=str, low_memory=False,
+                        usecols=lambda col: col in EXPECTED_COLUMNS or col == "Delivery Date", dtype=str, low_memory=False,
                     )
                 except Exception as e:
                     print(f"Error reading {b.name}: {e}")
