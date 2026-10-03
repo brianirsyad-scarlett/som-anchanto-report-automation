@@ -331,12 +331,16 @@ FINAL_COLUMN_ORDER = [
     # SentOn is Delivery Date, else Dispatch Date, else Dispatch Scheduled Date.
     # The raw Dispatch Date is still kept beside it for reference.
     "Dispatch Date",
+    # The raw delivery date alone (blank until the order is delivered). SentOn
+    # falls back to Dispatch / Scheduled date when there is no delivery date, so
+    # it cannot say whether an order was actually delivered.
+    "Delivery Date",
 ]
 
 # Columns with a non-string target type in the fixed output schema below.
 # Everything else in FINAL_COLUMN_ORDER is a string column.
 _INT_COLUMNS = {"Ordered Quantity", "Unit Price", "Discount Value"}
-_TIMESTAMP_COLUMNS = {"CreatedOn", "SentOn", "Dispatch Date"}
+_TIMESTAMP_COLUMNS = {"CreatedOn", "SentOn", "Dispatch Date", "Delivery Date"}
 
 
 def build_output_schema():
@@ -404,6 +408,8 @@ def transform_chunk(df, product_master):
     # SentOn = Delivery Date, else Dispatch Date, else Dispatch Scheduled Date
     df["SentOn"] = np.where(delivery.notna() & (delivery != ""), delivery,
                              np.where(dispatch.notna() & (dispatch != ""), dispatch, scheduled))
+    # Keep the delivery date on its own too (SentOn above is a blend).
+    df["Delivery Date"] = delivery
 
     drop_cols = ["Order Packing Date", "Delivery Date (DD/MM/YYYY)", "Dispatch Scheduled Date"]
     df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
@@ -412,7 +418,7 @@ def transform_chunk(df, product_master):
     # Source dates are dd/mm/yyyy. dayfirst must be explicit: pandas infers the
     # format from each chunk's first value, so a file starting on day <= 12 would
     # otherwise be read month-first (days 1-12 swapped, days 13+ -> NaT).
-    for col in ["CreatedOn", "SentOn", "Dispatch Date"]:
+    for col in ["CreatedOn", "SentOn", "Dispatch Date", "Delivery Date"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
     for col in ["Ordered Quantity", "Unit Price", "Discount Value"]:
