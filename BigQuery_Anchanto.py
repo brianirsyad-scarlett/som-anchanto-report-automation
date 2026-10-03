@@ -402,7 +402,11 @@ def load_product_master(bucket):
 def transform_chunk(df, product_master):
     """Apply the same per-row transforms the old full-concat version applied
     once to everything, but to a single file's rows at a time."""
-    delivery = df.get("Delivery Date (DD/MM/YYYY)", pd.Series([None] * len(df)))
+    # The Sep 2025 exports name this column "Delivery Date" (no format hint); every
+    # other export says "Delivery Date (DD/MM/YYYY)". Accept both, or those months
+    # would lose their delivery date and fall back to the dispatch date.
+    delivery = df.get("Delivery Date (DD/MM/YYYY)",
+                      df.get("Delivery Date", pd.Series([None] * len(df), index=df.index)))
     dispatch = df.get("Dispatch Date", pd.Series([None] * len(df)))
     scheduled = df.get("Dispatch Scheduled Date", pd.Series([None] * len(df)))
     # SentOn = Delivery Date, else Dispatch Date, else Dispatch Scheduled Date
