@@ -4,36 +4,17 @@ on:
   workflow_dispatch: {}
   # On time: Power Automate 'GitHub timer' -> dispatch.yml. Cron = backup only.
   schedule:
-    # Every 6 hours at :30 Asia/Jakarta (WIB, UTC+7): 00:30, 06:30, 12:30, 18:30
-    # = 17:30, 23:30, 05:30, 11:30 UTC. The run takes ~22 min, so the Sell In
-    # + PCC pipeline (which waits for it to finish) follows at :55.
-    - cron: "30 5,11,17,23 * * *"
+    # Every 6 hours: 05:xx, 11:xx, 17:xx, 23:xx UTC = 12, 18, 00, 06 WIB. Each slot is tried twice
+    # (:17 and :47) at off-peak minutes - GitHub delays or drops scheduled runs at :00 and :30. The
+    # second try ends in seconds if the first already rebuilt (see the "Skip if" step below).
+    - cron: "17,47 5,11,17,23 * * *"
 
 concurrency:
   group: anchanto-pipeline
   cancel-in-progress: false
 
 jobs:
-  # Backup (cron) runs skip themselves when the on-time run started by
-  # dispatch.yml (Power Automate "GitHub timer") already did the work - guard.sh.
-  guard:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: read
-      contents: read
-    outputs:
-      run: ${{ steps.g.outputs.run }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: g
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash guard.sh anchanto-pipeline.yml 300
-
   pipeline:
-    needs: guard
-    if: needs.guard.outputs.run == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
