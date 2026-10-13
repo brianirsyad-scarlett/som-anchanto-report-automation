@@ -9,6 +9,11 @@ on:
     # second try ends in seconds if the first already rebuilt (see the "Skip if" step below).
     - cron: "17,47 5,11,17,23 * * *"
 
+permissions:
+  contents: read
+  actions: read
+  issues: write   # failure mail = a MAIL| issue; Power Automate mails it
+
 concurrency:
   group: anchanto-pipeline
   cancel-in-progress: false
@@ -70,3 +75,10 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp_key.json
         run: python BigQuery_Anchanto.py
+
+      - name: Mail on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" --assignee brianirsyad-scarlett             --title "MAIL|Anchanto pipeline failed"             --body "A step failed - see the run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
