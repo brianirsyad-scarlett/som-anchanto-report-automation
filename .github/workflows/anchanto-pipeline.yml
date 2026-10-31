@@ -64,6 +64,21 @@ jobs:
           print("skip=true" if done else "skip=false", file=open(os.environ["GITHUB_OUTPUT"], "a"))
           EOF
 
+      # The iMac generates the report at ~:35 past EVEN hours; this generates it at :30 past ODD
+      # hours 01-21 WIB (23 is left to the iMac's nightly 3-period run), so it is fresh every hour.
+      # It never deletes a report that is still generating (waits 15 min, else skips).
+      - name: Generate the current period's report (odd hours 01-21 WIB only)
+        if: steps.guard.outputs.skip != 'true' && github.event_name != 'schedule'
+        env:
+          TZ: Asia/Jakarta
+        run: |
+          h=$(date +%-H)
+          if [ $((h % 2)) -eq 1 ] && [ "$h" -le 21 ]; then
+            python -u generate_anchanto_report.py
+          else
+            echo "hour $h WIB: the iMac generates on even hours - download only"
+          fi
+
       # Searches the home list AND the Deleted tab: each new report generated on Anchanto moves the
       # previous one to Deleted, but its download link keeps working, so the newest finished report
       # is always found. Sets stale=true (without failing) when report generation has stalled.
