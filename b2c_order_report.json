@@ -1,0 +1,17 @@
+{
+  "_comment": "Same B2C Order Report request the iMac generator uses (SOM_iMac/iMac_Sales Ops/b2c_order_report.json). Keep both identical.",
+  "report_schedule": {
+    "report_type_id": "3",
+    "report_format": "csv",
+    "report_occurrence_id": "5",
+    "mailing_list": ["brian.rinaldy@lmbg.co.id"],
+    "carrier_code": [],
+    "field_ids": ["12", "14", "16", "382", "22", "28", "34", "36", "44", "46", "1006", "66", "68", "677", "1079", "1108"],
+    "filters": {
+      "company_id": ["2"],
+      "campaign_code": [],
+      "warehouse_id": ["1"]
+    },
+    "notification_type": "email"
+  }
+}
