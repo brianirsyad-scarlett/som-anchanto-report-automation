@@ -64,11 +64,30 @@ jobs:
           print("skip=true" if done else "skip=false", file=open(os.environ["GITHUB_OUTPUT"], "a"))
           EOF
 
+      # Searches the home list AND the Deleted tab: each new report generated on Anchanto moves the
+      # previous one to Deleted, but its download link keeps working, so the newest finished report
+      # is always found. Sets stale=true (without failing) when report generation has stalled.
       - name: Download completed reports from Anchanto to GCS
+        id: download
         if: steps.guard.outputs.skip != 'true'
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp_key.json
         run: python download_anchanto_reports.py
+
+      - name: Mail if Anchanto report generation has stalled (once, while the issue is open)
+        if: steps.download.outputs.stale == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REASON: ${{ steps.download.outputs.stale_reason }}
+        run: |
+          title="MAIL|Anchanto reports are stale"
+          if gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number' | grep -q .; then
+            echo "warning issue already open - not mailing again"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --assignee brianirsyad-scarlett \
+              --title "$title" \
+              --body "$REASON. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. Close this issue once reports are fresh again."
+          fi
 
       - name: Process GCS raw CSVs into Excel, CSV, and Parquet
         if: steps.guard.outputs.skip != 'true'
