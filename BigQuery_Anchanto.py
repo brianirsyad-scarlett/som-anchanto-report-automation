@@ -11,6 +11,7 @@ COMBINED ANCHANTO PROCESSING SCRIPT (GCS INPUT/OUTPUT)
 
 import io
 import os
+import re
 import csv
 import tempfile
 import numpy as np
@@ -220,6 +221,37 @@ def filter_and_validate(df):
     df.drop(columns=['Marketplace_clean'], inplace=True)
     return df, removed_int, removed_empty, None
 
+# One Excel per 10-day period. When one run gets two raw reports for the same period, the
+# second used to be saved as "..._1.xlsx" and was then counted on top of the first: on
+# 2026-11-19 "Anchanto 26 11 Nov (2) - Order Report_1" (an older copy of Nov (2)) doubled
+# 683k units of 11-18 Nov in Anchanto.parquet. Now the newest raw report wins and the
+# others are removed (resolve_period_duplicates), and the Parquet build never reads a
+# "_<n>" file (DUPLICATE_SUFFIX).
+STEP1_OUTPUTS = []   # (base_filename, final_filename, raw blob updated) for this run
+DUPLICATE_SUFFIX = re.compile(r" - Order Report_\d+$")
+
+
+def resolve_period_duplicates(bucket):
+    """Keep only the newest raw report's Excel per period, under the plain period name."""
+    by_base = defaultdict(list)
+    for base, final, updated in STEP1_OUTPUTS:
+        by_base[base].append((updated, final))
+    for base, items in by_base.items():
+        if len(items) < 2:
+            continue
+        items.sort(key=lambda x: (x[0] is not None, x[0]))
+        winner = items[-1][1]
+        print(f"⚠️  {len(items)} raw reports for one period ({base[:-5]}): keeping the newest ({winner})")
+        if winner != base:
+            src = bucket.blob(f"{EXCEL_OUTPUT_PREFIX}/{winner}")
+            bucket.copy_blob(src, bucket, f"{EXCEL_OUTPUT_PREFIX}/{base}")
+            print(f"   • copied {winner} -> {base}")
+        for _, final in items:
+            if final != base:
+                bucket.blob(f"{EXCEL_OUTPUT_PREFIX}/{final}").delete()
+                print(f"   • 🗑️  removed {final}")
+
+
 def process_b2c_gcs_blob(blob, bucket, used_filenames_lock, used_filenames):
     """Process a single B2C Order Report CSV blob from GCS."""
     blob_filename = parse_gcs_blob_name(blob.name)
@@ -267,6 +299,8 @@ def process_b2c_gcs_blob(blob, bucket, used_filenames_lock, used_filenames):
         
         out_blob.upload_from_file(excel_buffer, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         print(f"   💾 Saved to GCS: {out_excel_blob_key}")
+        with used_filenames_lock:   # only a file that really landed can win resolve_period_duplicates
+            STEP1_OUTPUTS.append((base_filename, final_filename, blob.updated or blob.time_created))
         return (True, blob, out_blob, f"INT removed: {removed_int}, empty removed: {removed_empty}")
     except Exception as e:
         return (False, blob, None, f"Failed to save Excel: {e}")
@@ -477,6 +511,10 @@ def build_parquet_from_gcs_csvs(bucket):
     csv_blobs = [b for b in csv_blobs if parse_gcs_blob_name(b.name)[:-4] in excel_stems]
     for b in orphans:
         print(f"⏭️  Skipping orphan CSV with no source Excel: {parse_gcs_blob_name(b.name)}")
+    dupes = [b for b in csv_blobs if DUPLICATE_SUFFIX.search(parse_gcs_blob_name(b.name)[:-4])]
+    csv_blobs = [b for b in csv_blobs if b not in dupes]
+    for b in dupes:
+        print(f"⏭️  Skipping duplicate-period copy (would double count): {parse_gcs_blob_name(b.name)}")
 
     if not csv_blobs:
         print(f"⚠️  No CSV files found in gs://{GCS_BUCKET_NAME}/{CSV_OUTPUT_PREFIX}/")
@@ -599,6 +637,8 @@ def main():
                     failed += 1
                     print(f"\n❌ FAILED: {in_name}")
                     print(f"   • Error: {msg}")
+
+        resolve_period_duplicates(bucket)
 
         print("\n" + "-" * 70)
         print(f"STEP 1 COMPLETE:")
