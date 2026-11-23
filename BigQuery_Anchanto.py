@@ -58,7 +58,11 @@ MASTER_CSV_BLOB = "sales_parquet/Master Data Product.csv"
 # the local pipeline is retired.
 OUTPUT_PARQUET_BLOB = "sales_parquet/raw/primary/anchanto/Anchanto.parquet"
 
-MAX_WORKERS = 10
+# Each worker holds a whole raw report in memory and writes it to Excel with openpyxl
+# (several GB for a 700k-row 10-day report). 10 workers ran the runner out of memory
+# from 2026-11-21, when 100-180 MB backfill reports landed: every run was cancelled
+# mid-step and Anchanto.parquet stopped updating. Override with ANCHANTO_MAX_WORKERS.
+MAX_WORKERS = int(os.environ.get("ANCHANTO_MAX_WORKERS", "2"))
 DELETE_SOURCE = True
 
 # Allowed values for the Marketplace column
@@ -141,6 +145,16 @@ def get_order_date_from_df(df):
         series = df[col_name]
         first_val = series.dropna().iloc[0]
     return get_datetime_from_cell(first_val)
+
+def count_order_days(df):
+    """Number of distinct order days (dd/mm/yyyy prefix of 'Order Date') in a raw report."""
+    col_name = next((c for c in df.columns if c.lower() == "order date"), None)
+    if col_name is None:
+        return 0
+    if USE_POLARS and isinstance(df, pl.DataFrame):
+        return int(df[col_name].cast(pl.Utf8).str.slice(0, 10).drop_nulls().n_unique())
+    return int(df[col_name].astype(str).str[:10].nunique())
+
 
 def generate_output_filename(order_date, duplicate_counter=0):
     """Generate formatted output filename based on order date."""
@@ -229,26 +243,29 @@ def filter_and_validate(df):
 # 683k units of 11-18 Nov in Anchanto.parquet. Now the newest raw report wins and the
 # others are removed (resolve_period_duplicates), and the Parquet build never reads a
 # "_<n>" file (DUPLICATE_SUFFIX).
-STEP1_OUTPUTS = []   # (base_filename, final_filename, raw blob updated) for this run
+# The winner is the report that covers the most order days, then the newest: on 2026-11-20 a
+# newer report holding ONE day (12 Nov) replaced the full Nov (2) period and Nov fell 2.44M -> 2.27M.
+STEP1_OUTPUTS = []   # (base_filename, final_filename, raw blob updated, order days covered) for this run
 DUPLICATE_SUFFIX = re.compile(r" - Order Report_\d+$")
 
 
 def resolve_period_duplicates(bucket):
     """Keep only the newest raw report's Excel per period, under the plain period name."""
     by_base = defaultdict(list)
-    for base, final, updated in STEP1_OUTPUTS:
-        by_base[base].append((updated, final))
+    for base, final, updated, days in STEP1_OUTPUTS:
+        by_base[base].append((days, updated, final))
     for base, items in by_base.items():
         if len(items) < 2:
             continue
-        items.sort(key=lambda x: (x[0] is not None, x[0]))
-        winner = items[-1][1]
-        print(f"⚠️  {len(items)} raw reports for one period ({base[:-5]}): keeping the newest ({winner})")
+        items.sort(key=lambda x: (x[0], x[1] is not None, x[1]))
+        winner = items[-1][2]
+        print(f"⚠️  {len(items)} raw reports for one period ({base[:-5]}): keeping the one with the most "
+              f"order days, then the newest ({winner}, {items[-1][0]} days)")
         if winner != base:
             src = bucket.blob(f"{EXCEL_OUTPUT_PREFIX}/{winner}")
             bucket.copy_blob(src, bucket, f"{EXCEL_OUTPUT_PREFIX}/{base}")
             print(f"   • copied {winner} -> {base}")
-        for _, final in items:
+        for _, _, final in items:
             if final != base:
                 bucket.blob(f"{EXCEL_OUTPUT_PREFIX}/{final}").delete()
                 print(f"   • 🗑️  removed {final}")
@@ -278,6 +295,11 @@ def process_b2c_gcs_blob(blob, bucket, used_filenames_lock, used_filenames):
     if removed_empty > 0:
         print(f"   ⚠️  Removed {removed_empty} rows with empty Marketplace")
     print(f"   ✅ Kept {len(filtered_df)} valid rows")
+    try:
+        order_days = count_order_days(filtered_df)
+    except Exception:
+        order_days = 0
+    print(f"   📆 Order days covered: {order_days}")
 
     base_filename = generate_output_filename(order_date, 0)
     with used_filenames_lock:
@@ -290,6 +312,17 @@ def process_b2c_gcs_blob(blob, bucket, used_filenames_lock, used_filenames):
 
     out_excel_blob_key = f"{EXCEL_OUTPUT_PREFIX}/{final_filename}"
     out_blob = bucket.blob(out_excel_blob_key)
+    out_blob.metadata = {"order_days": str(order_days)}
+
+    # Never let a report that covers fewer order days replace the period's existing Excel
+    # (a 1-day report arriving alone in a later run would otherwise shrink the period).
+    if final_filename == base_filename and order_days:
+        existing = bucket.get_blob(out_excel_blob_key)
+        existing_days = int(((existing.metadata or {}).get("order_days") or 0)) if existing else 0
+        if existing_days > order_days:
+            return (True, blob, existing,
+                    f"KEPT existing {final_filename} ({existing_days} order days) over this "
+                    f"{order_days}-day report")
 
     try:
         excel_buffer = io.BytesIO()
@@ -302,7 +335,7 @@ def process_b2c_gcs_blob(blob, bucket, used_filenames_lock, used_filenames):
         out_blob.upload_from_file(excel_buffer, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         print(f"   💾 Saved to GCS: {out_excel_blob_key}")
         with used_filenames_lock:   # only a file that really landed can win resolve_period_duplicates
-            STEP1_OUTPUTS.append((base_filename, final_filename, blob.updated or blob.time_created))
+            STEP1_OUTPUTS.append((base_filename, final_filename, blob.updated or blob.time_created, order_days))
         return (True, blob, out_blob, f"INT removed: {removed_int}, empty removed: {removed_empty}")
     except Exception as e:
         return (False, blob, None, f"Failed to save Excel: {e}")
