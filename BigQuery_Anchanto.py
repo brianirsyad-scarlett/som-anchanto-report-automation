@@ -70,7 +70,9 @@ ALLOWED_MARKETPLACE_VALUES = {
     "END_Nexus",
     "WNJ_Manual Jatis",
     "WNJ_OfficialWebsite",
-    "MPL_Zalora"
+    "MPL_Zalora",
+    "MPL_Tokopedia",
+    "MPL_Tokopedia & Shop",
 }
 
 EXPECTED_COLUMNS = [
@@ -439,8 +441,16 @@ def transform_chunk(df, product_master):
     # The Sep 2025 exports name this column "Delivery Date" (no format hint); every
     # other export says "Delivery Date (DD/MM/YYYY)". Accept both, or those months
     # would lose their delivery date and fall back to the dispatch date.
+    #
+    # Since Nov 2026 Anchanto exports "Delivered On" (field 1940: the actual delivery timestamp,
+    # same meaning and format as the old "Delivery Date (DD/MM/YYYY)") and relabelled field 66 to
+    # "Estimated Delivery Date" - only an estimate, often before the order date, so it is NEVER
+    # used. Delivered On wins wherever it is filled; old-layout files keep their Delivery Date.
     delivery = df.get("Delivery Date (DD/MM/YYYY)",
                       df.get("Delivery Date", pd.Series([None] * len(df), index=df.index)))
+    if "Delivered On" in df.columns:
+        delivered_on = df["Delivered On"]
+        delivery = delivered_on.where(delivered_on.notna() & (delivered_on != ""), None)
     dispatch = df.get("Dispatch Date", pd.Series([None] * len(df)))
     scheduled = df.get("Dispatch Scheduled Date", pd.Series([None] * len(df)))
     # SentOn = Delivery Date, else Dispatch Date, else Dispatch Scheduled Date
@@ -539,7 +549,7 @@ def build_parquet_from_gcs_csvs(bucket):
                     content = b.download_as_bytes()
                     df = pd.read_csv(
                         io.BytesIO(content), encoding='utf-8',
-                        usecols=lambda col: col in EXPECTED_COLUMNS or col == "Delivery Date", dtype=str, low_memory=False,
+                        usecols=lambda col: col in EXPECTED_COLUMNS or col in ("Delivery Date", "Delivered On"), dtype=str, low_memory=False,
                     )
                 except Exception as e:
                     print(f"Error reading {b.name}: {e}")
